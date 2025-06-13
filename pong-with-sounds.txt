@@ -1,0 +1,1467 @@
+--@name Pong Final with Sounds
+--@author z3A3z
+--@shared
+
+-- Enhanced screen detection function
+local function findScreen()
+    local screenEnt = nil
+    local chipEnt = chip()
+    
+    -- Method 1: Check if chip is welded to something
+    if chipEnt:isValid() and chipEnt:isWeldedTo() then
+        local weldedEnt = chipEnt:isWeldedTo()
+        if weldedEnt:isValid() and weldedEnt:getClass() == "starfall_screen" then
+            screenEnt = weldedEnt
+        end
+    end
+    
+    -- Method 2: Find closest starfall_screen entity
+    if not screenEnt or not screenEnt:isValid() then
+        local chipPos = chipEnt:getPos()
+        local nearbyEnts = find.inSphere(chipPos, 500) -- Increased search radius
+        local closestDist = math.huge
+        
+        for _, ent in ipairs(nearbyEnts) do
+            if ent:isValid() and ent:getClass() == "starfall_screen" then
+                local dist = chipPos:getDistance(ent:getPos())
+                if dist < closestDist then
+                    closestDist = dist
+                    screenEnt = ent
+                end
+            end
+        end
+    end
+    
+    -- Method 3: Find ANY starfall_screen entity on the map
+    if not screenEnt or not screenEnt:isValid() then
+        local allEnts = find.all()
+        for _, ent in ipairs(allEnts) do
+            if ent:isValid() and ent:getClass() == "starfall_screen" then
+                screenEnt = ent
+                break
+            end
+        end
+    end
+    
+    -- Method 4: Use chip position as fallback
+    if not screenEnt or not screenEnt:isValid() then
+        screenEnt = chipEnt
+    end
+    
+    return screenEnt
+end
+
+if SERVER then
+    -- Server-side code
+    local players = {}
+    local gameState = "waiting"
+    local player1Ready = false
+    local player2Ready = false
+    local player1 = nil
+    local player2 = nil
+    
+    -- Game variables
+    local screenWidth = 512
+    local screenHeight = 512
+    local paddleWidth = 15
+    local paddleHeight = 80
+    local ballSize = 12
+    local ballSpeedX = 250
+    local ballSpeedY = 180
+    
+    -- Ball movement delay system
+    local ballMovementDelay = 3
+    local ballStartTime = 0
+    local ballCanMove = false
+    
+    -- Game positions
+    local paddle1Y = screenHeight / 2
+    local paddle2Y = screenHeight / 2
+    local ballX = screenWidth / 2
+    local ballY = screenHeight / 2
+    local ballVelX = ballSpeedX
+    local ballVelY = ballSpeedY
+    
+    -- Enhanced scoring with special effects
+    local score1 = 0
+    local score2 = 0
+    local winScore = 5
+    local rallyCount = 0
+    local maxRally = 0
+    
+    -- Bot system
+    local botEnabled = false
+    local botDifficulty = 0.7
+    local botPaddleTarget = screenHeight / 2
+    
+    -- Distance check
+    local maxDistance = 300
+    local lastDistanceCheck = 0
+    local distanceCheckInterval = 1.0
+    
+    -- Network update timing
+    local lastNetUpdate = 0
+    local netUpdateRate = 0.016
+    
+    -- Sound management
+    local soundPaths = {
+        paddle = {
+            "phx/epicmetal_soft1.wav",
+            "phx/epicmetal_soft2.wav",
+            "phx/epicmetal_soft3.wav",
+            "phx/epicmetal_soft4.wav",
+            "phx/epicmetal_soft5.wav",
+            "phx/epicmetal_soft6.wav",
+            "phx/epicmetal_soft7.wav"
+        },
+        wall = {
+            "phx/epicmetal_soft1.wav",
+            "phx/epicmetal_soft2.wav",
+            "phx/epicmetal_soft3.wav",
+            "phx/epicmetal_soft4.wav",
+            "phx/epicmetal_soft5.wav",
+            "phx/epicmetal_soft6.wav",
+            "phx/epicmetal_soft7.wav"
+        },
+        button = "garrysmod/ui_click.wav",
+        gameOver = {
+            "bot/good_one_sir.wav",
+            "bot/good_one_sir2.wav"
+        }
+    }
+    
+    -- Sound cooldown tracking
+    local lastSoundTime = {}
+    local soundCooldown = 0.05 -- Minimum time between sounds
+    
+    local function canPlaySound(soundType)
+        if not lastSoundTime[soundType] then
+            lastSoundTime[soundType] = 0
+        end
+        return timer.curtime() - lastSoundTime[soundType] > soundCooldown
+    end
+    
+    local function playServerSound(soundType)
+        if not canPlaySound(soundType) then return end
+        
+        local soundPath = nil
+        if type(soundPaths[soundType]) == "table" then
+            soundPath = soundPaths[soundType][math.random(1, #soundPaths[soundType])]
+        else
+            soundPath = soundPaths[soundType]
+        end
+        
+        if soundPath then
+            lastSoundTime[soundType] = timer.curtime()
+            
+            -- Send sound event to all clients
+            net.start("playSound")
+            net.writeString(soundType)
+            net.writeString(soundPath)
+            net.send()
+        end
+    end
+    
+    local function resetGame()
+        gameState = "waiting"
+        player1Ready = false
+        player2Ready = false
+        player1 = nil
+        player2 = nil
+        players = {}
+        score1 = 0
+        score2 = 0
+        ballX = screenWidth / 2
+        ballY = screenHeight / 2
+        ballVelX = ballSpeedX
+        ballVelY = ballSpeedY
+        ballCanMove = false
+        botEnabled = false
+        rallyCount = 0
+        maxRally = 0
+        net.start("gameReset")
+        net.send()
+    end
+    
+    -- Enhanced network setup with bot mode and better screen detection
+    net.receive("playerReady", function(len, ply)
+        local requestBot = net.readBool()
+        
+        -- Use enhanced screen detection
+        local screenEnt = findScreen()
+        
+        local playerDistance = ply:getPos():getDistance(screenEnt:getPos())
+        if playerDistance > maxDistance then
+            net.start("tooFarToJoin")
+            net.send(ply)
+            return
+        end
+        
+        -- Play button click sound
+        playServerSound("button")
+        
+        if gameState == "waiting" then
+            if requestBot then
+                -- Start bot game
+                player1 = ply
+                player1Ready = true
+                players[ply] = 1
+                player2 = "BOT"
+                player2Ready = true
+                botEnabled = true
+                
+                net.start("playerAssigned")
+                net.writeInt(1, 8)
+                net.send(ply)
+                
+                gameState = "playing"
+                ballX = screenWidth / 2
+                ballY = screenHeight / 2
+                ballVelX = ballSpeedX * (math.random() > 0.5 and 1 or -1)
+                ballVelY = ballSpeedY * (math.random() - 0.5) * 2
+                ballStartTime = timer.curtime()
+                ballCanMove = false
+                
+                net.start("gameStart")
+                net.writeFloat(ballMovementDelay)
+                net.writeBool(true) -- Bot mode
+                net.send()
+            else
+                -- Regular multiplayer
+                if not player1 then
+                    player1 = ply
+                    player1Ready = true
+                    players[ply] = 1
+                    net.start("playerAssigned")
+                    net.writeInt(1, 8)
+                    net.send(ply)
+                elseif not player2 and ply ~= player1 then
+                    player2 = ply
+                    player2Ready = true
+                    players[ply] = 2
+                    net.start("playerAssigned")
+                    net.writeInt(2, 8)
+                    net.send(ply)
+                end
+                
+                if player1Ready and player2Ready then
+                    gameState = "playing"
+                    ballX = screenWidth / 2
+                    ballY = screenHeight / 2
+                    ballVelX = ballSpeedX * (math.random() > 0.5 and 1 or -1)
+                    ballVelY = ballSpeedY * (math.random() - 0.5) * 2
+                    ballStartTime = timer.curtime()
+                    ballCanMove = false
+                    botEnabled = false
+                    
+                    net.start("gameStart")
+                    net.writeFloat(ballMovementDelay)
+                    net.writeBool(false) -- Not bot mode
+                    net.send()
+                end
+            end
+        end
+    end)
+    
+    net.receive("paddleUpdate", function(len, ply)
+        if players[ply] and gameState == "playing" then
+            local paddleY = net.readFloat()
+            paddleY = math.clamp(paddleY, paddleHeight/2, screenHeight - paddleHeight/2)
+            
+            if players[ply] == 1 then
+                paddle1Y = paddleY
+            else
+                paddle2Y = paddleY
+            end
+        end
+    end)
+    
+    -- Main game logic
+    hook.add("think", "serverGameLogic", function()
+        local curTime = timer.curtime()
+        
+        -- Distance checking with enhanced screen detection
+        if curTime - lastDistanceCheck > distanceCheckInterval then
+            lastDistanceCheck = curTime
+            local screenEnt = findScreen()
+            
+            if screenEnt and screenEnt:isValid() then
+                local screenPos = screenEnt:getPos()
+                local resetNeeded = false
+                
+                if player1 then
+                    if not player1:isValid() then
+                        resetNeeded = true
+                    else
+                        local dist = player1:getPos():getDistance(screenPos)
+                        if dist > maxDistance then
+                            resetNeeded = true
+                        end
+                    end
+                end
+                
+                if player2 and player2 ~= "BOT" then
+                    if not player2:isValid() then
+                        resetNeeded = true
+                    else
+                        local dist = player2:getPos():getDistance(screenPos)
+                        if dist > maxDistance then
+                            resetNeeded = true
+                        end
+                    end
+                end
+                
+                if resetNeeded then
+                    resetGame()
+                    return
+                end
+            end
+        end
+        
+        if gameState == "playing" then
+            local dt = timer.frametime()
+            
+            -- Bot AI logic
+            if botEnabled and player2 == "BOT" then
+                local ballSpeed = math.sqrt(ballVelX^2 + ballVelY^2)
+                local timeToReach = (screenWidth - 30 - paddleWidth - ballX) / math.abs(ballVelX)
+                local predictedY = ballY + ballVelY * timeToReach
+                
+                -- Add some randomness based on difficulty
+                local error = (1 - botDifficulty) * 100 * (math.random() - 0.5)
+                botPaddleTarget = predictedY + error
+                
+                -- Clamp bot paddle position
+                botPaddleTarget = math.clamp(botPaddleTarget, paddleHeight/2, screenHeight - paddleHeight/2)
+                
+                -- Move bot paddle with some delay for realism
+                local diff = botPaddleTarget - paddle2Y
+                local moveSpeed = 300 * botDifficulty
+                paddle2Y = paddle2Y + math.clamp(diff, -moveSpeed * dt, moveSpeed * dt)
+            end
+            
+            -- Check if ball can move
+            if not ballCanMove then
+                if timer.curtime() - ballStartTime >= ballMovementDelay then
+                    ballCanMove = true
+                    net.start("ballCanMove")
+                    net.send()
+                end
+            end
+            
+            -- Only update ball if it can move
+            if ballCanMove then
+                ballX = ballX + ballVelX * dt
+                ballY = ballY + ballVelY * dt
+                
+                -- Wall collisions with effects and sound
+                if ballY <= ballSize/2 then
+                    ballY = ballSize/2
+                    ballVelY = math.abs(ballVelY)
+                    -- Trigger wall effect and sound
+                    playServerSound("wall")
+                    net.start("wallHit")
+                    net.writeFloat(ballX)
+                    net.writeFloat(0) -- Top wall
+                    net.send()
+                elseif ballY >= screenHeight - ballSize/2 then
+                    ballY = screenHeight - ballSize/2
+                    ballVelY = -math.abs(ballVelY)
+                    -- Trigger wall effect and sound
+                    playServerSound("wall")
+                    net.start("wallHit")
+                    net.writeFloat(ballX)
+                    net.writeFloat(screenHeight) -- Bottom wall
+                    net.send()
+                end
+                
+                -- Enhanced paddle collisions with larger ball hitbox and sounds
+                local ballHitboxExpansion = 4 -- Increase ball hitbox by 4 pixels on each side
+                local ballLeft = ballX - ballSize/2 - ballHitboxExpansion
+                local ballRight = ballX + ballSize/2 + ballHitboxExpansion
+                local ballTop = ballY - ballSize/2 - ballHitboxExpansion
+                local ballBottom = ballY + ballSize/2 + ballHitboxExpansion
+                
+                -- Calculate previous ball position with expanded hitbox
+                local prevBallX = ballX - ballVelX * dt
+                local prevBallY = ballY - ballVelY * dt
+                local prevBallLeft = prevBallX - ballSize/2 - ballHitboxExpansion
+                local prevBallRight = prevBallX + ballSize/2 + ballHitboxExpansion
+                
+                local paddleHit = false
+                
+                -- Left paddle (player 1) - Enhanced collision with larger hitbox
+                local paddle1Left = 30
+                local paddle1Right = 30 + paddleWidth
+                local paddle1Top = paddle1Y - paddleHeight/2
+                local paddle1Bottom = paddle1Y + paddleHeight/2
+                
+                -- Check if ball is moving towards paddle and crosses paddle boundary
+                if ballVelX < 0 and not paddleHit then
+                    -- Check if ball crossed the paddle during this frame
+                    local ballCrossedPaddle = (prevBallRight > paddle1Right and ballLeft <= paddle1Right) or
+                                            (ballLeft <= paddle1Right + 12) -- Extended hit zone
+                    
+                    -- Check vertical overlap with paddle (expanded)
+                    local verticalOverlap = ballBottom >= paddle1Top - 8 and ballTop <= paddle1Bottom + 8
+                    
+                    if ballCrossedPaddle and verticalOverlap then
+                        local hitPos = (ballY - paddle1Y) / (paddleHeight/2)
+                        hitPos = math.clamp(hitPos, -1, 1)
+                        
+                        -- Reverse and modify ball velocity
+                        ballVelX = math.abs(ballVelX) * 1.05
+                        ballVelY = ballVelY + hitPos * 150
+                        
+                        -- Force ball position outside paddle with safety margin
+                        ballX = paddle1Right + ballSize/2 + ballHitboxExpansion + 3
+                        
+                        rallyCount = rallyCount + 1
+                        if rallyCount > maxRally then maxRally = rallyCount end
+                        
+                        -- Play paddle hit sound
+                        playServerSound("paddle")
+                        
+                        -- Trigger paddle hit effects
+                        net.start("paddleHit")
+                        net.writeInt(1, 8) -- Player 1
+                        net.writeFloat(ballY)
+                        net.writeInt(rallyCount, 16)
+                        net.send()
+                        paddleHit = true
+                    end
+                end
+                
+                -- Right paddle (player 2) - Enhanced collision with larger hitbox
+                if not paddleHit then
+                    local paddle2Left = screenWidth - 30 - paddleWidth
+                    local paddle2Right = screenWidth - 30
+                    local paddle2Top = paddle2Y - paddleHeight/2
+                    local paddle2Bottom = paddle2Y + paddleHeight/2
+                    
+                    -- Check if ball is moving towards paddle and crosses paddle boundary
+                    if ballVelX > 0 then
+                        -- Check if ball crossed the paddle during this frame
+                        local ballCrossedPaddle = (prevBallLeft < paddle2Left and ballRight >= paddle2Left) or
+                                                (ballRight >= paddle2Left - 12) -- Extended hit zone
+                        
+                        -- Check vertical overlap with paddle (expanded)
+                        local verticalOverlap = ballBottom >= paddle2Top - 8 and ballTop <= paddle2Bottom + 8
+                        
+                        if ballCrossedPaddle and verticalOverlap then
+                            local hitPos = (ballY - paddle2Y) / (paddleHeight/2)
+                            hitPos = math.clamp(hitPos, -1, 1)
+                            
+                            -- Reverse and modify ball velocity
+                            ballVelX = -math.abs(ballVelX) * 1.05
+                            ballVelY = ballVelY + hitPos * 150
+                            
+                            -- Force ball position outside paddle with safety margin
+                            ballX = paddle2Left - ballSize/2 - ballHitboxExpansion - 3
+                            
+                            rallyCount = rallyCount + 1
+                            if rallyCount > maxRally then maxRally = rallyCount end
+                            
+                            -- Play paddle hit sound
+                            playServerSound("paddle")
+                            
+                            -- Trigger paddle hit effects
+                            net.start("paddleHit")
+                            net.writeInt(2, 8) -- Player 2
+                            net.writeFloat(ballY)
+                            net.writeInt(rallyCount, 16)
+                            net.send()
+                        end
+                    end
+                end
+                
+                -- Enhanced scoring with effects
+                if ballX < -ballSize then
+                    score2 = score2 + 1
+                    rallyCount = 0
+                    
+                    -- Trigger score effects
+                    net.start("scoreEffect")
+                    net.writeInt(2, 8) -- Player 2 scored
+                    net.writeInt(score2, 16)
+                    net.send()
+                    
+                    if score2 >= winScore then
+                        gameState = "won"
+                        playServerSound("gameOver")
+                        net.start("gameWin")
+                        net.writeInt(2, 8)
+                        net.writeInt(maxRally, 16) -- Send max rally
+                        net.send()
+                        timer.simple(5, function()
+                            resetGame()
+                        end)
+                    else
+                        ballX = screenWidth / 2
+                        ballY = screenHeight / 2
+                        ballVelX = ballSpeedX
+                        ballVelY = ballSpeedY * (math.random() - 0.5) * 2
+                        ballCanMove = false
+                        ballStartTime = timer.curtime()
+                        net.start("ballReset")
+                        net.writeFloat(ballMovementDelay)
+                        net.send()
+                    end
+                elseif ballX > screenWidth + ballSize then
+                    score1 = score1 + 1
+                    rallyCount = 0
+                    
+                    -- Trigger score effects
+                    net.start("scoreEffect")
+                    net.writeInt(1, 8) -- Player 1 scored
+                    net.writeInt(score1, 16)
+                    net.send()
+                    
+                    if score1 >= winScore then
+                        gameState = "won"
+                        playServerSound("gameOver")
+                        net.start("gameWin")
+                        net.writeInt(1, 8)
+                        net.writeInt(maxRally, 16) -- Send max rally
+                        net.send()
+                        timer.simple(5, function()
+                            resetGame()
+                        end)
+                    else
+                        ballX = screenWidth / 2
+                        ballY = screenHeight / 2
+                        ballVelX = -ballSpeedX
+                        ballVelY = ballSpeedY * (math.random() - 0.5) * 2
+                        ballCanMove = false
+                        ballStartTime = timer.curtime()
+                        net.start("ballReset")
+                        net.writeFloat(ballMovementDelay)
+                        net.send()
+                    end
+                end
+            end
+            
+            -- Send enhanced updates
+            if curTime - lastNetUpdate > netUpdateRate then
+                lastNetUpdate = curTime
+                net.start("gameSync")
+                net.writeFloat(ballX)
+                net.writeFloat(ballY)
+                net.writeFloat(ballVelX)
+                net.writeFloat(ballVelY)
+                net.writeFloat(paddle1Y)
+                net.writeFloat(paddle2Y)
+                net.writeInt(score1, 16)
+                net.writeInt(score2, 16)
+                net.writeInt(rallyCount, 16)
+                net.writeBool(botEnabled)
+                net.send()
+            end
+        end
+    end)
+    
+    -- Player disconnect handling
+    hook.add("PlayerDisconnected", "resetGame", function(ply)
+        if ply == player1 or ply == player2 then
+            resetGame()
+        end
+    end)
+
+else
+    -- Client-side code
+    local screenWidth = 512
+    local screenHeight = 512
+    local paddleWidth = 15
+    local paddleHeight = 80
+    local ballSize = 12
+    
+    -- Game state
+    local gameState = "waiting"
+    local playerNumber = 0
+    local winner = 0
+    local winTimer = 0
+    local botMode = false
+    local maxRally = 0
+    
+    -- Ball movement
+    local ballMovementDelay = 3
+    local ballCanMove = true
+    local ballCountdown = 0
+    
+    -- Enhanced visual effects
+    local rallyCount = 0
+    local speedLines = {}
+    local wallHitEffects = {}
+    local paddleHitEffects = {}
+    local scoreEffects = {}
+    local backgroundPulse = 0
+    local ballGlow = 0
+    local rallyGlow = 0
+    local matrixRain = {}
+    local fireworks = {}
+    
+    -- Lightning effects
+    local lightningBolts = {}
+    local lightningTimer = 0
+    
+    -- Positions
+    local paddle1Y = screenHeight / 2
+    local paddle2Y = screenHeight / 2
+    local ballX = screenWidth / 2
+    local ballY = screenHeight / 2
+    local ballVelX = 250
+    local ballVelY = 180
+    
+    -- Interpolation
+    local targetBallX = screenWidth / 2
+    local targetBallY = screenHeight / 2
+    local interpSpeed = 15
+    
+    -- Scores
+    local score1 = 0
+    local score2 = 0
+    
+    -- UI - Enhanced with bot button
+    local readyButtonHover = false
+    local botButtonHover = false
+    
+    -- Visual effects
+    local particles = {}
+    local trailPoints = {}
+    local glowIntensity = 0
+    local screenShake = 0
+    local winParticlesSpawned = false
+    
+    -- Sound system using StarfallEx API
+    local soundInstances = {}
+    local soundsEnabled = false
+    
+    -- Check for sound permissions on initialization
+    hook.add("think", "checkSoundPermission", function()
+        if hasPermission("sound.create") then
+            soundsEnabled = true
+            hook.remove("think", "checkSoundPermission")
+        end
+    end)
+    
+    -- Request permission if we don't have it
+    if not hasPermission("sound.create") then
+        setupPermissionRequest({"sound.create"}, "Sound effects for Pong game", true)
+    end
+    
+    -- Sound helper function for StarfallEx
+    local function playClientSound(soundPath)
+        if not soundPath or not soundsEnabled then return end
+        
+        -- Check permissions first
+        if not hasPermission("sound.create") then 
+            soundsEnabled = false
+            return 
+        end
+        
+        -- Check if we can create sounds
+        if not sound.canCreate or not sound.canCreate() then return end
+        
+        -- Try to create and play the sound
+        local success = pcall(function()
+            -- Attach sound to chip entity
+            local snd = sound.create(chip(), soundPath, false)
+            if snd then
+                snd:play()
+                snd:setVolume(0.7)
+                
+                -- Store the sound instance
+                table.insert(soundInstances, snd)
+                
+                -- Automatically destroy sound after it finishes
+                timer.simple(sound.duration(soundPath) + 0.1, function()
+                    if snd and snd.destroy then
+                        pcall(snd.destroy, snd)
+                        -- Remove from our tracking table
+                        for i, s in ipairs(soundInstances) do
+                            if s == snd then
+                                table.remove(soundInstances, i)
+                                break
+                            end
+                        end
+                    end
+                end)
+            end
+        end)
+        
+        if not success then
+            -- Silently fail if sound creation fails
+        end
+    end
+    
+    -- Clean up sounds on deinit
+    hook.add("removed", "cleanupSounds", function()
+        for _, snd in ipairs(soundInstances) do
+            if snd and snd.destroy then
+                pcall(snd.destroy, snd)
+            end
+        end
+    end)
+    
+    -- Network receivers
+    net.receive("playerAssigned", function()
+        playerNumber = net.readInt(8)
+        gameState = "ready"
+    end)
+    
+    net.receive("tooFarToJoin", function()
+        gameState = "tooFar"
+        timer.simple(3, function()
+            if gameState == "tooFar" then
+                gameState = "waiting"
+            end
+        end)
+    end)
+    
+    net.receive("gameStart", function()
+        gameState = "playing"
+        ballMovementDelay = net.readFloat()
+        botMode = net.readBool()
+        ballCanMove = false
+        ballCountdown = ballMovementDelay
+        trailPoints = {}
+        particles = {}
+        winParticlesSpawned = false
+        rallyCount = 0
+        
+        -- Start matrix rain effect
+        matrixRain = {}
+        for i = 1, 10 do
+            createMatrixRain()
+        end
+    end)
+    
+    net.receive("ballCanMove", function()
+        ballCanMove = true
+        ballCountdown = 0
+    end)
+    
+    net.receive("ballReset", function()
+        ballMovementDelay = net.readFloat()
+        ballCanMove = false
+        ballCountdown = ballMovementDelay
+        ballX = screenWidth / 2
+        ballY = screenHeight / 2
+        targetBallX = screenWidth / 2
+        targetBallY = screenHeight / 2
+    end)
+    
+    net.receive("gameReset", function()
+        gameState = "waiting"
+        playerNumber = 0
+        score1 = 0
+        score2 = 0
+        winner = 0
+        ballX = screenWidth / 2
+        ballY = screenHeight / 2
+        targetBallX = screenWidth / 2
+        targetBallY = screenHeight / 2
+        trailPoints = {}
+        particles = {}
+        readyButtonHover = false
+        botButtonHover = false
+        botMode = false
+        rallyCount = 0
+        maxRally = 0
+    end)
+    
+    net.receive("gameWin", function()
+        winner = net.readInt(8)
+        maxRally = net.readInt(16)
+        gameState = "win"
+        winTimer = timer.curtime() + 5
+        
+        if not winParticlesSpawned then
+            winParticlesSpawned = true
+            
+            -- Epic fireworks show
+            for i = 1, 5 do
+                timer.simple(i * 0.3, function()
+                    createFirework(
+                        math.random(100, screenWidth - 100),
+                        math.random(100, screenHeight - 100)
+                    )
+                end)
+            end
+            
+            -- Lightning celebration
+            createLightning(0, screenHeight/2, screenWidth, screenHeight/2)
+            createLightning(screenWidth/2, 0, screenWidth/2, screenHeight)
+            
+            screenShake = 3.0
+            glowIntensity = 5.0
+            backgroundPulse = 2.0
+        end
+    end)
+    
+    net.receive("gameSync", function()
+        local newBallX = net.readFloat()
+        local newBallY = net.readFloat()
+        
+        local dx = math.abs(newBallX - ballX)
+        local dy = math.abs(newBallY - ballY)
+        
+        if dx > 100 or dy > 100 then
+            ballX = newBallX
+            ballY = newBallY
+            trailPoints = {}
+        else
+            targetBallX = newBallX
+            targetBallY = newBallY
+        end
+        
+        ballVelX = net.readFloat()
+        ballVelY = net.readFloat()
+        paddle1Y = net.readFloat()
+        paddle2Y = net.readFloat()
+        score1 = net.readInt(16)
+        score2 = net.readInt(16)
+        rallyCount = net.readInt(16)
+        botMode = net.readBool()
+        
+        -- Update glow based on rally
+        rallyGlow = math.min(rallyCount / 20, 1)
+    end)
+    
+    -- Sound receiver
+    net.receive("playSound", function()
+        local soundType = net.readString()
+        local soundPath = net.readString()
+        
+        -- Play the sound using StarfallEx API
+        playClientSound(soundPath)
+    end)
+    
+    -- Enhanced effect receivers
+    net.receive("wallHit", function()
+        local hitX = net.readFloat()
+        local hitY = net.readFloat()
+        
+        table.insert(wallHitEffects, {
+            x = hitX,
+            y = hitY,
+            lifetime = 0.5,
+            maxLifetime = 0.5,
+            ripples = {}
+        })
+        
+        -- Create ripple effect
+        local effect = wallHitEffects[#wallHitEffects]
+        for i = 1, 3 do
+            table.insert(effect.ripples, {
+                radius = 0,
+                maxRadius = 50 + i * 20,
+                alpha = 255
+            })
+        end
+        
+        screenShake = 0.8
+        createLightning(hitX, hitY, hitX + math.random(-100, 100), hitY + math.random(-50, 50))
+    end)
+    
+    net.receive("paddleHit", function()
+        local player = net.readInt(8)
+        local hitY = net.readFloat()
+        local rally = net.readInt(16)
+        
+        local hitX = player == 1 and (30 + paddleWidth) or (screenWidth - 30 - paddleWidth)
+        
+        table.insert(paddleHitEffects, {
+            x = hitX,
+            y = hitY,
+            player = player,
+            lifetime = 0.8,
+            maxLifetime = 0.8,
+            shockwave = 0
+        })
+        
+        screenShake = 1.0 + (rally / 10)
+        ballGlow = 1.5
+        
+        -- Create speed lines
+        createSpeedLine()
+        
+        -- Lightning from paddle to ball
+        createLightning(hitX, hitY, ballX, ballY)
+        
+        -- Combo effects
+        if rally >= 5 then
+            for i = 1, 5 do
+                createFirework(hitX + math.random(-30, 30), hitY + math.random(-30, 30))
+            end
+        end
+    end)
+    
+    net.receive("scoreEffect", function()
+        local scorer = net.readInt(8)
+        local newScore = net.readInt(16)
+        
+        table.insert(scoreEffects, {
+            player = scorer,
+            score = newScore,
+            lifetime = 2.0,
+            maxLifetime = 2.0,
+            scale = 0.1
+        })
+        
+        screenShake = 2.0
+        backgroundPulse = 1.5
+        
+        -- Score celebration
+        for i = 1, 8 do
+            createFirework(
+                scorer == 1 and screenWidth/4 or 3*screenWidth/4,
+                100 + i * 20
+            )
+        end
+        
+        rallyGlow = 0
+    end)
+    
+    -- Initialize all hooks after functions are defined
+    timer.simple(0, function()
+        -- Enhanced game logic with special effects
+        hook.add("think", "gameLogic", function()
+        local dt = timer.frametime()
+        
+        -- Update ball countdown
+        if not ballCanMove and ballCountdown and ballCountdown > 0 then
+            ballCountdown = ballCountdown - dt
+            if ballCountdown <= 0 then
+                ballCanMove = true
+            end
+        end
+        
+        -- Update screen effects
+        screenShake = math.max(0, screenShake - dt * 4)
+        backgroundPulse = math.max(0, backgroundPulse - dt * 2)
+        ballGlow = math.max(0, ballGlow - dt * 3)
+        
+        -- Lightning timer
+        lightningTimer = lightningTimer + dt
+        if lightningTimer > 0.1 then
+            lightningTimer = 0
+            -- Random lightning during intense rallies
+            if rallyCount > 10 and math.random() < 0.3 then
+                createLightning(
+                    math.random(0, screenWidth),
+                    0,
+                    math.random(0, screenWidth),
+                    screenHeight
+                )
+            end
+        end
+        
+        if gameState == "playing" then
+            if ballCanMove then
+                ballX = ballX + (targetBallX - ballX) * interpSpeed * dt
+                ballY = ballY + (targetBallY - ballY) * interpSpeed * dt
+                
+                ballX = ballX + ballVelX * dt * 0.2
+                ballY = ballY + ballVelY * dt * 0.2
+                
+                -- Create speed lines for fast ball
+                if timer.curtime() % 0.1 < dt then
+                    createSpeedLine()
+                end
+                
+                -- Enhanced trail
+                if timer.curtime() % 0.03 < dt then
+                    table.insert(trailPoints, 1, {
+                        x = ballX, 
+                        y = ballY, 
+                        alpha = 255,
+                        size = ballSize * (1 + ballGlow * 0.5)
+                    })
+                    if #trailPoints > 12 then
+                        table.remove(trailPoints)
+                    end
+                end
+            end
+        end
+        
+        -- Update enhanced effects
+        
+        -- Speed lines
+        for i = #speedLines, 1, -1 do
+            local line = speedLines[i]
+            line.lifetime = line.lifetime - dt
+            line.alpha = (line.lifetime / 0.3) * 255
+            if line.lifetime <= 0 then
+                table.remove(speedLines, i)
+            end
+        end
+        
+        -- Lightning bolts
+        for i = #lightningBolts, 1, -1 do
+            local bolt = lightningBolts[i]
+            bolt.lifetime = bolt.lifetime - dt
+            bolt.intensity = bolt.intensity * 0.95
+            if bolt.lifetime <= 0 then
+                table.remove(lightningBolts, i)
+            end
+        end
+        
+        -- Wall hit effects
+        for i = #wallHitEffects, 1, -1 do
+            local effect = wallHitEffects[i]
+            effect.lifetime = effect.lifetime - dt
+            
+            for _, ripple in ipairs(effect.ripples) do
+                ripple.radius = ripple.radius + 150 * dt
+                ripple.alpha = (1 - ripple.radius / ripple.maxRadius) * 255
+            end
+            
+            if effect.lifetime <= 0 then
+                table.remove(wallHitEffects, i)
+            end
+        end
+        
+        -- Paddle hit effects
+        for i = #paddleHitEffects, 1, -1 do
+            local effect = paddleHitEffects[i]
+            effect.lifetime = effect.lifetime - dt
+            effect.shockwave = effect.shockwave + 100 * dt
+            
+            if effect.lifetime <= 0 then
+                table.remove(paddleHitEffects, i)
+            end
+        end
+        
+        -- Score effects
+        for i = #scoreEffects, 1, -1 do
+            local effect = scoreEffects[i]
+            effect.lifetime = effect.lifetime - dt
+            effect.scale = math.min(effect.scale + dt * 2, 1.5)
+            
+            if effect.lifetime <= 0 then
+                table.remove(scoreEffects, i)
+            end
+        end
+        
+        -- Matrix rain
+        for i = #matrixRain, 1, -1 do
+            local drop = matrixRain[i]
+            drop.y = drop.y + drop.speed * dt
+            drop.lifetime = drop.lifetime - dt
+            drop.alpha = drop.alpha * 0.995
+            
+            if drop.y > screenHeight or drop.lifetime <= 0 then
+                table.remove(matrixRain, i)
+            end
+        end
+        
+        -- Add new matrix rain
+        if timer.curtime() % 0.2 < dt then
+            createMatrixRain()
+        end
+        
+        -- Update regular particles
+        for i = #particles, 1, -1 do
+            local p = particles[i]
+            p.x = p.x + p.vx * dt
+            p.y = p.y + p.vy * dt
+            p.vy = p.vy + 80 * dt
+            p.lifetime = p.lifetime - dt
+            
+            if p.lifetime <= 0 then
+                table.remove(particles, i)
+            end
+        end
+        
+        -- Update visual effects
+        glowIntensity = math.max(0, glowIntensity - dt * 2)
+        
+        -- Trail fade
+        if timer.curtime() % 0.05 < dt then
+            for _, point in ipairs(trailPoints) do
+                point.alpha = math.max(0, point.alpha - 25)
+            end
+        end
+    end)
+    
+    -- Enhanced input handling with bot button
+    hook.add("inputPressed", "handleInput", function(key)
+        if key == KEY.E then
+            if gameState == "waiting" then
+                if readyButtonHover then
+                    net.start("playerReady")
+                    net.writeBool(false) -- Not bot mode
+                    net.send()
+                elseif botButtonHover then
+                    net.start("playerReady")
+                    net.writeBool(true) -- Bot mode
+                    net.send()
+                end
+            end
+        end
+    end)
+    
+    -- Epic rendering with special effects
+    hook.add("render", "drawGame", function()
+        local shakeX = screenShake * math.random(-3, 3)
+        local shakeY = screenShake * math.random(-3, 3)
+        
+        -- Dynamic background with pulse effect
+        local bgR = math.clamp(10 + glowIntensity * 30 + backgroundPulse * 40 + rallyGlow * 20, 10, 100)
+        local bgG = math.clamp(10 + glowIntensity * 20 + backgroundPulse * 20 + rallyGlow * 30, 10, 80)
+        local bgB = math.clamp(15 + glowIntensity * 40 + backgroundPulse * 60 + rallyGlow * 40, 15, 120)
+        render.setBackgroundColor(Color(bgR, bgG, bgB))
+        render.clear()
+        
+        -- Matrix rain background effect
+        render.setFont("Default")
+        for _, drop in ipairs(matrixRain) do
+            render.setColor(Color(0, 255, 0, drop.alpha * 0.3))
+            render.drawSimpleText(drop.x, drop.y, drop.char, 0, 0)
+        end
+        
+        local cursorX, cursorY = render.cursorPos()
+        
+        if gameState == "waiting" then
+            if cursorX and cursorY then
+                readyButtonHover = pointInRect(cursorX, cursorY, screenWidth/2 - 75, screenHeight/2 - 60, 150, 50)
+                botButtonHover = pointInRect(cursorX, cursorY, screenWidth/2 - 75, screenHeight/2 + 10, 150, 50)
+            else
+                readyButtonHover = false
+                botButtonHover = false
+            end
+            
+            -- Epic title with multiple glow layers
+            render.setFont("DermaLarge")
+            local titlePulse = math.sin(timer.curtime() * 3) * 0.3 + 0.7
+            
+            -- Multiple glow layers for epic effect
+            for i = 1, 5 do
+                local offset = i * 2
+                local alpha = (150 - i * 25) * titlePulse
+                render.setColor(Color(100, 200, 255, alpha))
+                render.drawSimpleText(screenWidth/2 + offset, 100 + offset, "NEON PONG DELUXE", 1, 1)
+            end
+            
+            -- Main title
+            render.setColor(Color(255, 255, 255))
+            render.drawSimpleText(screenWidth/2, 100, "NEON PONG DELUXE", 1, 1)
+            
+            -- Enhanced buttons with glow effects
+            render.setFont("Default")
+            
+            -- Multiplayer button
+            local btn1Pulse = readyButtonHover and (math.sin(timer.curtime() * 10) * 0.5 + 0.5) or 0.7
+            if readyButtonHover then
+                for i = 1, 3 do
+                    render.setColor(Color(100, 255, 100, 100 - i * 20))
+                    render.drawRectOutline(screenWidth/2 - 75 - i*2, screenHeight/2 - 60 - i*2, 150 + i*4, 50 + i*4, 2)
+                end
+            end
+            local btn1Color = Color(60 + btn1Pulse * 100, 80 + btn1Pulse * 120, 120 + btn1Pulse * 100)
+            render.setColor(btn1Color)
+            render.drawRect(screenWidth/2 - 75, screenHeight/2 - 60, 150, 50)
+            render.setColor(Color(255, 255, 255))
+            render.drawRectOutline(screenWidth/2 - 75, screenHeight/2 - 60, 150, 50, 2)
+            render.drawSimpleText(screenWidth/2, screenHeight/2 - 45, " MULTIPLAYER", 1, 1)
+            render.drawSimpleText(screenWidth/2, screenHeight/2 - 25, "Press E", 1, 1)
+            
+            -- Bot battle button
+            local btn2Pulse = botButtonHover and (math.sin(timer.curtime() * 10) * 0.5 + 0.5) or 0.7
+            if botButtonHover then
+                for i = 1, 3 do
+                    render.setColor(Color(255, 100, 100, 100 - i * 20))
+                    render.drawRectOutline(screenWidth/2 - 75 - i*2, screenHeight/2 + 10 - i*2, 150 + i*4, 50 + i*4, 2)
+                end
+            end
+            local btn2Color = Color(120 + btn2Pulse * 100, 60 + btn2Pulse * 40, 80 + btn2Pulse * 80)
+            render.setColor(btn2Color)
+            render.drawRect(screenWidth/2 - 75, screenHeight/2 + 10, 150, 50)
+            render.setColor(Color(255, 255, 255))
+            render.drawRectOutline(screenWidth/2 - 75, screenHeight/2 + 10, 150, 50, 2)
+            render.drawSimpleText(screenWidth/2, screenHeight/2 + 25, " VS BOT", 1, 1)
+            render.drawSimpleText(screenWidth/2, screenHeight/2 + 45, "Press E", 1, 1)
+            
+            -- Enhanced instructions
+            render.setColor(Color(180, 200, 255, 200))
+            render.setFont("Default")
+            render.drawSimpleText(screenWidth/2, screenHeight - 100, " EPIC NEON PONG EXPERIENCE ", 1, 1)
+            render.drawSimpleText(screenWidth/2, screenHeight - 80, " Choose Multiplayer or Bot Battle!", 1, 1)
+            render.drawSimpleText(screenWidth/2, screenHeight - 60, " WITH SOUND EFFECTS!", 1, 1)
+            render.drawSimpleText(screenWidth/2, screenHeight - 40, " First to 5 points wins!", 1, 1)
+            
+        elseif gameState == "ready" then
+            render.setFont("DermaLarge")
+            local pulse = math.sin(timer.curtime() * 3) * 0.4 + 0.6
+            render.setColor(Color(255, 255, 255, 150 + pulse * 105))
+            if botMode then
+                render.drawSimpleText(screenWidth/2, screenHeight/2, " Bot Battle Starting...", 1, 1)
+            else
+                render.drawSimpleText(screenWidth/2, screenHeight/2, "Waiting for other player...", 1, 1)
+            end
+            render.setFont("Default")
+            render.setColor(Color(150, 200, 255))
+            render.drawSimpleText(screenWidth/2, screenHeight/2 + 40, "You are Player " .. playerNumber, 1, 1)
+            
+        elseif gameState == "tooFar" then
+            render.setFont("DermaLarge")
+            render.setColor(Color(255, 150, 100))
+            render.drawSimpleText(screenWidth/2, screenHeight/2 - 20, "Too far from screen!", 1, 1)
+            render.setFont("Default")
+            render.setColor(Color(200, 200, 200))
+            render.drawSimpleText(screenWidth/2, screenHeight/2 + 20, "Move closer to the screen to play", 1, 1)
+        end
+        
+        if gameState == "playing" or gameState == "win" then
+            -- Update paddle position
+            if playerNumber > 0 and cursorX and cursorY and gameState == "playing" then
+                local targetY = math.clamp(cursorY, paddleHeight/2, screenHeight - paddleHeight/2)
+                
+                net.start("paddleUpdate")
+                net.writeFloat(targetY)
+                net.send()
+                
+                if playerNumber == 1 then
+                    paddle1Y = targetY
+                else
+                    paddle2Y = targetY
+                end
+            end
+            
+            -- Draw lightning bolts
+            for _, bolt in ipairs(lightningBolts) do
+                render.setColor(Color(200, 200, 255, bolt.intensity))
+                for i = 1, #bolt.segments - 1 do
+                    local seg1 = bolt.segments[i]
+                    local seg2 = bolt.segments[i + 1]
+                    render.drawLine(seg1.x + shakeX, seg1.y + shakeY, seg2.x + shakeX, seg2.y + shakeY)
+                end
+            end
+            
+            -- Draw speed lines
+            for _, line in ipairs(speedLines) do
+                render.setColor(Color(255, 255, 100, line.alpha))
+                local endX = line.x + math.cos(line.angle) * line.length
+                local endY = line.y + math.sin(line.angle) * line.length
+                render.drawLine(line.x + shakeX, line.y + shakeY, endX + shakeX, endY + shakeY)
+            end
+            
+            -- Draw wall hit effects
+            for _, effect in ipairs(wallHitEffects) do
+                for _, ripple in ipairs(effect.ripples) do
+                    if ripple.radius < ripple.maxRadius then
+                        render.setColor(Color(100, 200, 255, ripple.alpha))
+                        render.drawCircle(effect.x + shakeX, effect.y + shakeY, ripple.radius)
+                    end
+                end
+            end
+            
+            -- Draw paddle hit effects
+            for _, effect in ipairs(paddleHitEffects) do
+                local alpha = (effect.lifetime / effect.maxLifetime) * 255
+                local color = effect.player == 1 and Color(100, 200, 255, alpha) or Color(255, 100, 120, alpha)
+                render.setColor(color)
+                render.drawCircle(effect.x + shakeX, effect.y + shakeY, effect.shockwave)
+            end
+            
+            -- Enhanced center line with glow
+            render.setColor(Color(100, 120, 255, 120 + rallyGlow * 100))
+            for i = 0, screenHeight, 30 do
+                local alpha = 120 + math.sin((i + timer.curtime() * 100) * 0.1) * 50 + rallyGlow * 100
+                render.setColor(Color(100, 120, 255, alpha))
+                render.drawRect(screenWidth/2 - 3 + shakeX, i + shakeY, 6, 15)
+            end
+            
+            -- Regular particles
+            for _, p in ipairs(particles) do
+                local alpha = (p.lifetime / p.maxLifetime) * 255
+                render.setColor(Color(p.color.r, p.color.g, p.color.b, alpha))
+                render.drawRect(p.x - 2 + shakeX, p.y - 2 + shakeY, 4, 4)
+            end
+            
+            -- Enhanced ball trail with glow
+            for i, point in ipairs(trailPoints) do
+                if point.alpha > 15 then
+                    local trailAlpha = point.alpha * (1 - i/#trailPoints * 0.8)
+                    local size = point.size * (1 - i/#trailPoints * 0.7)
+                    
+                    -- Glow effect
+                    render.setColor(Color(150, 220, 255, trailAlpha * 0.3))
+                    render.drawRect(point.x - size + shakeX, point.y - size + shakeY, size * 2, size * 2)
+                    
+                    -- Main trail
+                    render.setColor(Color(200, 240, 255, trailAlpha))
+                    render.drawRect(point.x - size/2 + shakeX, point.y - size/2 + shakeY, size, size)
+                end
+            end
+            
+            -- Enhanced paddles with glow
+            -- Player 1 paddle
+            render.setColor(Color(50, 150, 255, 100))
+            render.drawRect(25 + shakeX, paddle1Y - paddleHeight/2 - 5 + shakeY, paddleWidth + 10, paddleHeight + 10)
+            render.setColor(Color(100, 180, 255))
+            render.drawRect(30 + shakeX, paddle1Y - paddleHeight/2 + shakeY, paddleWidth, paddleHeight)
+            
+            -- Player 2 paddle with bot indicator
+            if botMode then
+                render.setColor(Color(255, 100, 100, 150))
+                render.drawRect(screenWidth - 35 - paddleWidth + shakeX, paddle2Y - paddleHeight/2 - 5 + shakeY, paddleWidth + 10, paddleHeight + 10)
+            else
+                render.setColor(Color(255, 50, 50, 100))
+                render.drawRect(screenWidth - 35 - paddleWidth + shakeX, paddle2Y - paddleHeight/2 - 5 + shakeY, paddleWidth + 10, paddleHeight + 10)
+            end
+            render.setColor(Color(255, 100, 120))
+            render.drawRect(screenWidth - 30 - paddleWidth + shakeX, paddle2Y - paddleHeight/2 + shakeY, paddleWidth, paddleHeight)
+            
+            -- Epic ball with multiple glow layers
+            local ballGlowSize = ballSize * (2 + ballGlow * 2)
+            for i = 1, 4 do
+                local glowAlpha = (100 - i * 20) * (1 + ballGlow)
+                render.setColor(Color(255, 255, 150, glowAlpha))
+                local glowSize = ballGlowSize + i * 4
+                render.drawRect(ballX - glowSize/2 + shakeX, ballY - glowSize/2 + shakeY, glowSize, glowSize)
+            end
+            
+            -- Main ball
+            render.setColor(Color(255, 255, 255))
+            render.drawRect(ballX - ballSize/2 + shakeX, ballY - ballSize/2 + shakeY, ballSize, ballSize)
+            
+            -- Enhanced scores with glow and scale
+            render.setFont("DermaLarge")
+            
+            -- Score effects
+            for _, effect in ipairs(scoreEffects) do
+                local alpha = (effect.lifetime / effect.maxLifetime) * 255
+                local color = effect.player == 1 and Color(100, 200, 255, alpha) or Color(255, 100, 120, alpha)
+                render.setColor(color)
+                local x = effect.player == 1 and screenWidth/4 or 3*screenWidth/4
+                render.drawSimpleText(x, 50, "+" .. effect.score, 1, 1)
+            end
+            
+            -- Main scores
+            render.setColor(Color(100, 180, 255))
+            render.drawSimpleText(screenWidth/4, 50, tostring(score1), 1, 1)
+            render.setColor(Color(255, 100, 120))
+            render.drawSimpleText(3*screenWidth/4, 50, tostring(score2), 1, 1)
+            
+            -- Rally counter with epic glow
+            if rallyCount > 0 then
+                render.setFont("Default")
+                local rallyAlpha = 200 + rallyGlow * 55
+                
+                -- Glow effect for rally
+                for i = 1, 3 do
+                    render.setColor(Color(255, 255, 100, rallyAlpha / (i + 1)))
+                    render.drawSimpleText(screenWidth/2 + i, 120 + i, "Rally: " .. rallyCount, 1, 1)
+                end
+                
+                render.setColor(Color(255, 255, 255))
+                render.drawSimpleText(screenWidth/2, 120, "Rally: " .. rallyCount, 1, 1)
+                
+                if rallyCount >= 5 then
+                    render.setColor(Color(255, 150, 100, rallyAlpha))
+                    render.drawSimpleText(screenWidth/2, 140, " ON FIRE! ", 1, 1)
+                end
+            end
+            
+            -- Bot mode indicator
+            if botMode then
+                render.setFont("Default")
+                render.setColor(Color(255, 150, 100))
+                render.drawSimpleText(3*screenWidth/4, screenHeight - 25, " BOT", 1, 1)
+            end
+            
+            -- Player indicators
+            render.setFont("Default")
+            if playerNumber == 1 then
+                render.setColor(Color(120, 255, 120))
+                render.drawSimpleText(screenWidth/4, screenHeight - 25, " YOU", 1, 1)
+            elseif playerNumber == 2 then
+                render.setColor(Color(120, 255, 120))
+                render.drawSimpleText(3*screenWidth/4, screenHeight - 25, "YOU ", 1, 1)
+            end
+            
+            -- Ball countdown with epic effects
+            if not ballCanMove and ballCountdown and ballCountdown > 0 then
+                render.setFont("DermaLarge")
+                local countdownText = math.ceil(ballCountdown)
+                
+                -- Epic countdown glow
+                for i = 1, 5 do
+                    local glowAlpha = (200 - i * 30)
+                    render.setColor(Color(255, 255, 100, glowAlpha))
+                    render.drawSimpleText(screenWidth/2 + i*2, screenHeight/2 - 60 + i*2, tostring(countdownText), 1, 1)
+                end
+                
+                render.setColor(Color(255, 255, 255))
+                render.drawSimpleText(screenWidth/2, screenHeight/2 - 60, tostring(countdownText), 1, 1)
+                render.setFont("Default")
+                render.setColor(Color(200, 200, 200))
+                render.drawSimpleText(screenWidth/2, screenHeight/2 - 30, "Get Ready!", 1, 1)
+            end
+            
+            -- Epic win screen
+            if gameState == "win" then
+                local remaining = winTimer - timer.curtime()
+                if remaining > 0 then
+                    -- Animated overlay with pulse
+                    local overlayAlpha = 150 + math.sin(timer.curtime() * 4) * 50
+                    render.setColor(Color(0, 0, 0, overlayAlpha))
+                    render.drawRect(0, 0, screenWidth, screenHeight)
+                    
+                    -- Epic winner announcement with multiple glow layers
+                    render.setFont("DermaLarge")
+                    local winColor = winner == 1 and Color(120, 200, 255) or Color(255, 120, 150)
+                    local winPulse = math.sin(timer.curtime() * 6) * 0.4 + 0.6
+                    
+                    -- Multiple epic glow layers
+                    for i = 1, 8 do
+                        local glowAlpha = (150 - i * 15) * winPulse
+                        local offset = i * 3
+                        render.setColor(Color(winColor.r, winColor.g, winColor.b, glowAlpha))
+                        render.drawSimpleText(screenWidth/2 + offset, screenHeight/2 - 40 + offset, 
+                                            "PLAYER " .. winner .. " WINS!", 1, 1)
+                    end
+                    
+                    -- Main win text
+                    render.setColor(Color(255, 255, 255))
+                    render.drawSimpleText(screenWidth/2, screenHeight/2 - 40, "PLAYER " .. winner .. " WINS!", 1, 1)
+                    
+                    -- Game statistics with glow
+                    render.setFont("Default")
+                    render.setColor(Color(200, 200, 200))
+                    if maxRally > 0 then
+                        render.drawSimpleText(screenWidth/2, screenHeight/2 + 10, 
+                                            " Longest Rally: " .. maxRally, 1, 1)
+                    end
+                    
+                    if botMode then
+                        render.setColor(Color(255, 150, 100))
+                        render.drawSimpleText(screenWidth/2, screenHeight/2 + 30, " Bot Battle Complete!", 1, 1)
+                    end
+                    
+                    -- Countdown with epic glow
+                    for i = 1, 3 do
+                        render.setColor(Color(255, 255, 100, 200 - i * 50))
+                        render.drawSimpleText(screenWidth/2 + i, screenHeight/2 + 60 + i, 
+                                            "New game in " .. math.ceil(remaining) .. "...", 1, 1)
+                    end
+                    render.setColor(Color(255, 255, 255))
+                    render.drawSimpleText(screenWidth/2, screenHeight/2 + 60, 
+                                        "New game in " .. math.ceil(remaining) .. "...", 1, 1)
+                    
+                    -- Personal victory message
+                    if winner == playerNumber then
+                        render.setColor(Color(150, 255, 150))
+                        render.drawSimpleText(screenWidth/2, screenHeight/2 + 90, " EPIC VICTORY! ", 1, 1)
+                    elseif playerNumber > 0 then
+                        render.setColor(Color(150, 200, 255))
+                        render.drawSimpleText(screenWidth/2, screenHeight/2 + 90, "Good game! Try again!", 1, 1)
+                    end
+                end
+            end
+        end
+    end)
+    
+end -- End of client-side code (else block)
